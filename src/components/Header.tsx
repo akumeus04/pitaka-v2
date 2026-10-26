@@ -10,6 +10,10 @@ import {
   ShieldAlert,
   Coins,
   RefreshCw,
+  LogOut,
+  User,
+  CloudCheck,
+  Check
 } from 'lucide-react';
 import { getDaysUntilPayday } from '../services/holidays';
 
@@ -28,6 +32,10 @@ interface HeaderProps {
   onRefreshRate: () => void;
   isRefreshingRate: boolean;
   exchangeRate: number;
+  userEmail: string | null;
+  onLogout: () => void;
+  onSyncAll: () => void;
+  isSyncingAll: boolean;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -45,6 +53,10 @@ export const Header: React.FC<HeaderProps> = ({
   onRefreshRate,
   isRefreshingRate,
   exchangeRate,
+  userEmail,
+  onLogout,
+  onSyncAll,
+  isSyncingAll,
 }) => {
   const paydayInfo = getDaysUntilPayday();
 
@@ -135,6 +147,16 @@ export const Header: React.FC<HeaderProps> = ({
               </span>
             </div>
 
+            {/* Cloud Sync (Firebase + GAS) button */}
+            <button
+              onClick={onSyncAll}
+              title="Sync live Firebase Realtime Database and Google Sheets / Calendar"
+              className="p-2 rounded-lg text-teal-700 dark:text-teal-300 bg-teal-50 dark:bg-teal-950/60 hover:bg-teal-100 dark:hover:bg-teal-900 border border-teal-200 dark:border-teal-800 transition-colors"
+              aria-label="Sync Cloud Data"
+            >
+              <RefreshCw className={`w-4 h-4 ${isSyncingAll ? 'animate-spin text-teal-600' : ''}`} />
+            </button>
+
             {/* Live Exchange Rate Indicator */}
             <button
               onClick={onRefreshRate}
@@ -220,6 +242,24 @@ export const Header: React.FC<HeaderProps> = ({
             >
               {darkMode ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-slate-600" />}
             </button>
+
+            {/* User Profile & Logout */}
+            <div className="flex items-center gap-1.5 pl-1 border-l border-slate-200 dark:border-slate-800">
+              <span 
+                className="hidden xl:inline text-xs font-semibold text-slate-700 dark:text-slate-300 max-w-[120px] truncate" 
+                title={userEmail ? `Logged in as ${userEmail}` : 'Guest / Demo Mode'}
+              >
+                {userEmail ? userEmail.split('@')[0] : 'Guest'}
+              </span>
+              <button
+                onClick={onLogout}
+                title={userEmail ? `Log out (${userEmail})` : 'Switch account / Login'}
+                className="p-2 rounded-lg text-slate-500 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 border border-slate-200 dark:border-slate-700 transition-colors"
+                aria-label="Log Out"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            </div>
 
           </div>
 

@@ -9,6 +9,16 @@ import {
 } from './types';
 import { AppStorage } from './services/storage';
 import { fetchLiveExchangeRate, DEFAULT_PHP_RATE } from './services/currency';
+import { 
+  auth, 
+  startFirebaseSync, 
+  saveItemToFirebaseAndGAS, 
+  deleteItemFromFirebase, 
+  saveBudgetLimitToFirebase,
+  logoutUser
+} from './services/firebase';
+import { onAuthStateChanged, User } from 'firebase/auth';
+import { fetchAuxiliaryDataFromGAS, fetchHolidaysFromGAS, backupToGAS } from './services/gas';
 import { playReminderChime } from './services/audio';
 
 import { Header } from './components/Header';
@@ -24,13 +34,9 @@ import { AnnualReportView } from './components/AnnualReportView';
 import { MonthSummaryModal } from './components/MonthSummaryModal';
 import { CalculatorModal } from './components/CalculatorModal';
 import { CalendarModal } from './components/CalendarModal';
+import { LoginScreen } from './components/LoginScreen';
 
 export default function App() {
-  // Initialize storage once
-  useEffect(() => {
-    AppStorage.init();
-  }, []);
-
   const todayDate = new Date();
   const currentMonthStr = `${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, '0')}`;
 
@@ -39,6 +45,14 @@ export default function App() {
   const [activeMonth, setActiveMonth] = useState<string>(currentMonthStr);
   const [exchangeRate, setExchangeRate] = useState<number>(DEFAULT_PHP_RATE);
   const [isRefreshingRate, setIsRefreshingRate] = useState<boolean>(false);
+  const [isSyncingAll, setIsSyncingAll] = useState<boolean>(false);
+
+  // Auth state
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authChecked, setAuthChecked] = useState<boolean>(false);
+  const [isGuestMode, setIsGuestMode] = useState<boolean>(() => {
+    return localStorage.getItem('pitaka_guest_mode') === '1';
+  });
 
   // Data states from AppStorage
   const [income, setIncome] = useState<IncomeItem[]>(() => AppStorage.getIncome());
@@ -64,6 +78,64 @@ export default function App() {
   const [selectedMonthSummary, setSelectedMonthSummary] = useState<FinancialSummaryMonth | null>(null);
   const [isCalculatorOpen, setIsCalculatorOpen] = useState<boolean>(false);
   const [isCalendarOpen, setIsCalendarOpen] = useState<boolean>(false);
+
+  // Initialize storage once
+  useEffect(() => {
+    AppStorage.init();
+  }, []);
+
+  // Monitor Firebase Authentication
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+      setAuthChecked(true);
+      if (user) {
+        setIsGuestMode(false);
+        localStorage.removeItem('pitaka_guest_mode');
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Subscribe to Firebase Realtime Database
+  useEffect(() => {
+    // Only subscribe if authenticated or if Firebase is active
+    let unsubscribeSync: (() => void) | undefined;
+
+    if (currentUser) {
+      unsubscribeSync = startFirebaseSync({
+        onIncomeChange: (items) => {
+          setIncome(items);
+          AppStorage.saveIncome(items);
+        },
+        onExpensesChange: (items) => {
+          setExpenses(items);
+          AppStorage.saveExpenses(items);
+        },
+        onLoansChange: (items) => {
+          setLoans(items);
+          AppStorage.saveLoans(items);
+        },
+        onAllowancesChange: (items) => {
+          setAllowances(items);
+          AppStorage.saveAllowances(items);
+        },
+        onTodosChange: (items) => {
+          setTodos(items);
+          AppStorage.saveTodos(items);
+        },
+        onBudgetLimitChange: (limit) => {
+          setBudgetLimit(limit);
+          AppStorage.saveBudgetLimit(limit);
+        },
+        liveRate: exchangeRate,
+      });
+    }
+
+    return () => {
+      if (unsubscribeSync) unsubscribeSync();
+    };
+  }, [currentUser, exchangeRate]);
 
   // Sync theme to root class
   useEffect(() => {
@@ -93,6 +165,20 @@ export default function App() {
 
   useEffect(() => {
     handleRefreshExchangeRate();
+  }, [handleRefreshExchangeRate]);
+
+  // Sync with Google Apps Script
+  const handleSyncAll = useCallback(async () => {
+    setIsSyncingAll(true);
+    try {
+      await Promise.allSettled([
+        handleRefreshExchangeRate(),
+        fetchAuxiliaryDataFromGAS(),
+        fetchHolidaysFromGAS(),
+      ]);
+    } finally {
+      setIsSyncingAll(false);
+    }
   }, [handleRefreshExchangeRate]);
 
   // Privacy mouseleave & focus detection
@@ -148,7 +234,6 @@ export default function App() {
   // Keyboard Shortcuts (Alt+1..9, ESC, ArrowLeft/Right)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't trigger if typing in an input
       const target = e.target as HTMLElement;
       const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT';
 
@@ -199,65 +284,122 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [activeMonth]);
 
-  // CRUD Handlers
-  const handleAddExpense = (newExp: Omit<ExpenseItem, 'id'>) => {
-    const item: ExpenseItem = { ...newExp, id: `exp-${Date.now()}` };
+  // Dual-Save CRUD Handlers: Firebase Realtime Database + Google Apps Script
+  const handleAddExpense = async (newExp: Omit<ExpenseItem, 'id'>) => {
+    const tempId = `exp-${Date.now()}`;
+    const item: ExpenseItem = { ...newExp, id: tempId };
     const next = [...expenses, item];
     setExpenses(next);
     AppStorage.saveExpenses(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('expenses', item as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual save to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleUpdateExpense = (updatedExp: ExpenseItem) => {
+  const handleUpdateExpense = async (updatedExp: ExpenseItem) => {
     const next = expenses.map((e) => (e.id === updatedExp.id ? updatedExp : e));
     setExpenses(next);
     AppStorage.saveExpenses(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('expenses', updatedExp as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual update to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleDeleteExpense = (id: string) => {
+  const handleDeleteExpense = async (id: string) => {
     const next = expenses.filter((e) => e.id !== id);
     setExpenses(next);
     AppStorage.saveExpenses(next);
+
+    try {
+      await deleteItemFromFirebase('expenses', id);
+    } catch (e) {
+      console.warn('Firebase delete logged:', e);
+    }
   };
 
-  const handleAddLoan = (newLoan: Omit<LoanItem, 'id'>) => {
-    const item: LoanItem = { ...newLoan, id: `loan-${Date.now()}` };
+  const handleAddLoan = async (newLoan: Omit<LoanItem, 'id'>) => {
+    const tempId = `loan-${Date.now()}`;
+    const item: LoanItem = { ...newLoan, id: tempId };
     const next = [...loans, item];
     setLoans(next);
     AppStorage.saveLoans(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('loans', item as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual save to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleUpdateLoan = (updatedLoan: LoanItem) => {
+  const handleUpdateLoan = async (updatedLoan: LoanItem) => {
     const next = loans.map((l) => (l.id === updatedLoan.id ? updatedLoan : l));
     setLoans(next);
     AppStorage.saveLoans(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('loans', updatedLoan as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual update to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleDeleteLoan = (id: string) => {
+  const handleDeleteLoan = async (id: string) => {
     const next = loans.filter((l) => l.id !== id);
     setLoans(next);
     AppStorage.saveLoans(next);
+
+    try {
+      await deleteItemFromFirebase('loans', id);
+    } catch (e) {
+      console.warn('Firebase delete logged:', e);
+    }
   };
 
-  const handleAddIncome = (newInc: Omit<IncomeItem, 'id'>) => {
-    const item: IncomeItem = { ...newInc, id: `inc-${Date.now()}` };
+  const handleAddIncome = async (newInc: Omit<IncomeItem, 'id'>) => {
+    const tempId = `inc-${Date.now()}`;
+    const item: IncomeItem = { ...newInc, id: tempId };
     const next = [...income, item];
     setIncome(next);
     AppStorage.saveIncome(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('income', item as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual save to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleUpdateIncome = (updatedInc: IncomeItem) => {
+  const handleUpdateIncome = async (updatedInc: IncomeItem) => {
     const next = income.map((i) => (i.id === updatedInc.id ? updatedInc : i));
     setIncome(next);
     AppStorage.saveIncome(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('income', updatedInc as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual update to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleDeleteIncome = (id: string) => {
+  const handleDeleteIncome = async (id: string) => {
     const next = income.filter((i) => i.id !== id);
     setIncome(next);
     AppStorage.saveIncome(next);
+
+    try {
+      await deleteItemFromFirebase('income', id);
+    } catch (e) {
+      console.warn('Firebase delete logged:', e);
+    }
   };
 
-  const handleDuplicateAllIncomeToNextMonth = () => {
+  const handleDuplicateAllIncomeToNextMonth = async () => {
     const currentList = income.filter((inc) => (inc.applicableMonth || '').startsWith(activeMonth));
     if (currentList.length === 0) {
       alert('There are no income entries in this month to duplicate!');
@@ -284,56 +426,103 @@ export default function App() {
     setIncome(next);
     AppStorage.saveIncome(next);
     setActiveMonth(nextMonthStr);
+
+    for (const item of duplicated) {
+      saveItemToFirebaseAndGAS('income', item as unknown as Record<string, unknown>);
+    }
   };
 
-  const handleAddAllowance = (newAlw: Omit<AllowanceItem, 'id'>) => {
-    const item: AllowanceItem = { ...newAlw, id: `alw-${Date.now()}` };
+  const handleAddAllowance = async (newAlw: Omit<AllowanceItem, 'id'>) => {
+    const tempId = `alw-${Date.now()}`;
+    const item: AllowanceItem = { ...newAlw, id: tempId };
     const next = [...allowances, item];
     setAllowances(next);
     AppStorage.saveAllowances(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('allowances', {
+        ...item,
+        breakdown: JSON.stringify(item.breakdown),
+      } as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual save to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleUpdateAllowance = (updatedAlw: AllowanceItem) => {
+  const handleUpdateAllowance = async (updatedAlw: AllowanceItem) => {
     const next = allowances.map((a) => (a.id === updatedAlw.id ? updatedAlw : a));
     setAllowances(next);
     AppStorage.saveAllowances(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('allowances', {
+        ...updatedAlw,
+        breakdown: JSON.stringify(updatedAlw.breakdown),
+      } as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual update to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleDeleteAllowance = (id: string) => {
+  const handleDeleteAllowance = async (id: string) => {
     const next = allowances.filter((a) => a.id !== id);
     setAllowances(next);
     AppStorage.saveAllowances(next);
+
+    try {
+      await deleteItemFromFirebase('allowances', id);
+    } catch (e) {
+      console.warn('Firebase delete logged:', e);
+    }
   };
 
-  const handleAddReminder = (newRem: Omit<BillReminderItem, 'id'>) => {
-    const item: BillReminderItem = { ...newRem, id: `todo-${Date.now()}` };
+  const handleAddReminder = async (newRem: Omit<BillReminderItem, 'id'>) => {
+    const tempId = `todo-${Date.now()}`;
+    const item: BillReminderItem = { ...newRem, id: tempId };
     const next = [...todos, item];
     setTodos(next);
     AppStorage.saveTodos(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('todos', item as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual save to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleUpdateReminder = (updatedRem: BillReminderItem) => {
+  const handleUpdateReminder = async (updatedRem: BillReminderItem) => {
     const next = todos.map((t) => (t.id === updatedRem.id ? updatedRem : t));
     setTodos(next);
     AppStorage.saveTodos(next);
+
+    try {
+      await saveItemToFirebaseAndGAS('todos', updatedRem as unknown as Record<string, unknown>);
+    } catch (e) {
+      console.warn('Dual update to Firebase/GAS logged:', e);
+    }
   };
 
-  const handleDeleteReminder = (id: string) => {
+  const handleDeleteReminder = async (id: string) => {
     const next = todos.filter((t) => t.id !== id);
     setTodos(next);
     AppStorage.saveTodos(next);
+
+    try {
+      await deleteItemFromFirebase('todos', id);
+    } catch (e) {
+      console.warn('Firebase delete logged:', e);
+    }
   };
 
-  const handleMarkReminderPaid = (reminder: BillReminderItem) => {
+  const handleMarkReminderPaid = async (reminder: BillReminderItem) => {
     const updated = { ...reminder, status: 'Paid' as const };
-    handleUpdateReminder(updated);
+    await handleUpdateReminder(updated);
 
-    // If linked to a loan, increment payment number
     if (reminder.relatedLoanId) {
       const targetLoan = loans.find((l) => l.id === reminder.relatedLoanId);
       if (targetLoan) {
         const nextNum = (targetLoan.currentPaymentNumber || 0) + 1;
-        handleUpdateLoan({
+        await handleUpdateLoan({
           ...targetLoan,
           currentPaymentNumber: nextNum,
           status: nextNum >= targetLoan.duration ? 'Paid' : targetLoan.status,
@@ -342,14 +531,45 @@ export default function App() {
     }
   };
 
-  const handleUpdateBudgetLimit = (limit: number) => {
+  const handleUpdateBudgetLimit = async (limit: number) => {
     setBudgetLimit(limit);
     AppStorage.saveBudgetLimit(limit);
+    try {
+      await saveBudgetLimitToFirebase(limit);
+    } catch (e) {
+      console.warn('Budget limit firebase sync logged:', e);
+    }
   };
+
+  const handleLogout = async () => {
+    if (confirm('Are you sure you want to log out of your wallet?')) {
+      await logoutUser();
+      setCurrentUser(null);
+      setIsGuestMode(false);
+      localStorage.removeItem('pitaka_guest_mode');
+    }
+  };
+
+  // If auth has not resolved yet or user is neither logged in nor in guest mode, show Login Screen
+  const showLogin = authChecked && !currentUser && !isGuestMode;
 
   return (
     <div className={`min-h-screen flex flex-col ${privacyBlur && isBlurredAway ? 'select-none' : ''}`}>
       
+      {/* Restored Google Login Screen */}
+      {showLogin && (
+        <LoginScreen
+          onSuccess={() => {
+            setIsGuestMode(false);
+            localStorage.removeItem('pitaka_guest_mode');
+          }}
+          onContinueAsGuest={() => {
+            setIsGuestMode(true);
+            localStorage.setItem('pitaka_guest_mode', '1');
+          }}
+        />
+      )}
+
       {/* Privacy Blur Overlay Screen */}
       {privacyBlur && isBlurredAway && (
         <div 
@@ -382,6 +602,10 @@ export default function App() {
         onRefreshRate={handleRefreshExchangeRate}
         isRefreshingRate={isRefreshingRate}
         exchangeRate={exchangeRate}
+        userEmail={currentUser?.email || (isGuestMode ? 'Guest Mode' : null)}
+        onLogout={handleLogout}
+        onSyncAll={handleSyncAll}
+        isSyncingAll={isSyncingAll}
       />
 
       {/* Main Container */}
