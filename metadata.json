@@ -1,0 +1,6 @@
+{
+  "name": "Pitaka - Expenses & Debt Tracking",
+  "description": "Comprehensive dual-currency personal finance and debt tracker featuring 24-month rolling forecast, automated payment reminders, visual analytics, and live exchange conversion.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
